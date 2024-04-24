@@ -1,0 +1,699 @@
+/*final updated on Oct 24 2023 - revised*/
+import de.hybris.platform.core.Registry
+import de.hybris.platform.servicelayer.search.FlexibleSearchService
+import de.hybris.platform.servicelayer.search.FlexibleSearchQuery
+import de.hybris.platform.servicelayer.search.SearchResult
+import de.hybris.platform.hac.data.dto.SqlSearchResultData
+import de.hybris.platform.hac.facade.HacFlexibleSearchFacade
+import de.hybris.bootstrap.config.ConfigUtil
+//import groovyx.net.http.HttpResponseException
+import groovy.json.JsonBuilder
+import org.apache.http.HttpEntity
+import org.apache.http.HttpHeaders
+import org.apache.http.HttpResponse
+import org.apache.http.client.methods.HttpPatch
+import org.apache.http.entity.ContentType
+import org.apache.http.entity.StringEntity
+import org.apache.http.impl.client.CloseableHttpClient
+import org.apache.http.impl.client.HttpClients
+import org.apache.http.util.EntityUtils
+import org.apache.http.HttpEntity
+import org.apache.http.HttpHeaders
+import org.apache.http.HttpResponse
+import org.apache.http.client.HttpClient
+import org.apache.http.client.methods.HttpGet
+import org.apache.http.impl.client.HttpClients
+import org.apache.http.util.EntityUtils
+import groovy.json.JsonSlurper
+import org.slf4j.Logger
+import org.slf4j.LoggerFactory
+import groovy.transform.CompileStatic
+import org.apache.commons.lang3.StringUtils
+
+/**
+ * The KFA class represents a feature with various attributes.
+ * It provides methods to initialize the object and represent it as a string.
+ */
+
+class KFA {
+    String featureId
+    String enableMeth
+    List<String> enableArg
+    List<String> usedMeth
+    List<List<String>> usedArg
+    String featureType
+    
+    /**
+     * Constructor for the KFA class.
+     * Initializes the object with provided arguments or default values.
+     *
+     * @param args A map containing the attributes for the KFA object.
+     */
+
+    KFA(Map args) {
+        featureId = args['featureId'] ?: ""
+        enableMeth = args['enableMeth'] ?: ""
+        enableArg = args['enableArg'] ?: []
+        usedMeth = args['usedMeth'] ?: []
+        usedArg = args['usedArg'] ?: []
+        featureType = args['featureType'] ?: ""
+    }
+    /**
+     * Converts the KFA object to a string representation.
+     *
+     * @return A string representation of the KFA object.
+     */
+    String toString() {
+        return "Feature ID: ${featureId}\n" +
+                "Enable Method: ${enableMeth}\n" +
+                "Enable Arguments: ${enableArg}\n" +
+                "Used Methods: ${usedMeth}\n" +
+                "Used Arguments: ${usedArg}\n" +
+                "Feature Type: ${featureType}\n" 
+    }
+}
+
+/* Global variables for access token and sheet ID. */
+def accessToken = ""
+def sheetId = "01EDWKAXKQ72NMWRFAGFGLDXO5IDEJITUY"
+
+/**
+ * Retrieves the list of loaded extensions.
+ */
+loadedExtensions = []
+ConfigUtil.getPlatformConfig(Registry.class).getExtensionInfosInBuildOrder().each { extensionInfo ->
+    loadedExtensions.add(extensionInfo)
+
+}
+
+/**
+ * Checks if a bean with the given name exists in the application context.
+ * If the bean exists, it is returned; otherwise, a warning is logged.
+ *
+ * @param beanName The name of the bean to check.
+ * @return The bean object if it exists, null otherwise.
+ */
+
+def getBeanIfExists(String beanName) {
+    def applicationContext = Registry.getGlobalApplicationContext()
+    def beanExists = applicationContext?.containsBean(beanName) ?: false
+    def log = LoggerFactory.getLogger("SpringBeanHelper")
+
+    beanExists ? applicationContext.getBean(beanName) : log.warn("Bean with name '{}' not found in the application context.", beanName)
+}
+
+/**
+ * Converts sheet data into a list of KFA objects.
+ * Processes each row of the sheet data and initializes KFA objects.
+ *
+ * @param sheetData The data from the Excel sheet.
+ * @param userFeatureType The feature type to filter by.
+ * @param argSeparator The separator used for arguments (default is ',').
+ * @return A list of KFA objects.
+ */
+  
+def sheetDataToKFA(sheetData, userFeatureType, argSeparator = ',') {
+  def kfaList = sheetData.collect { row ->
+ 
+      
+        def featureId = row[0] ?: ""
+        def enableMeth = row[1] ?: ""
+        def enableArg = row[2]?.split(argSeparator)?.collect { arg -> arg.trim() }
+        enableArg = enableArg ? enableArg.findAll { it != '' } : []
+
+        def usedMethodsAndArgs = row[3]?.split(";")?.collect { it.trim() }
+        usedMethodsAndArgs = usedMethodsAndArgs ? usedMethodsAndArgs.findAll { it != '' } : []
+
+        def usedMeth = []
+        def usedArg = []
+
+        usedMethodsAndArgs.each { usedMethodAndArgs ->
+            def methodAndArgs = usedMethodAndArgs.split(":")
+            def methodName = methodAndArgs[0].trim()
+            def methodArgs = methodAndArgs[1].trim()
+
+           
+
+            if (methodArgs.contains(argSeparator)) {
+                // Method requires multiple arguments, split and collect
+                usedMeth << methodName
+                usedArg << methodArgs.split(argSeparator).collect { arg -> arg.trim() }
+            } else {
+                // Method requires single argument, add directly to usedArg
+                usedMeth << methodName
+                usedArg << [methodArgs]
+            }
+        }
+ 		def featureType = row[4]?: ""
+       
+        if (featureType == userFeatureType || featureType == "X") {    
+           new KFA(
+              featureId: featureId,
+              enableMeth: enableMeth,
+              enableArg: enableArg,
+              usedMeth: usedMeth,
+              usedArg: usedArg,  
+              featureType: featureType
+        )
+        }
+      
+    }.findAll { it != null }
+
+    return kfaList
+}
+
+/**
+ * Reads KFA data from an Excel sheet using the Microsoft Graph API.
+ * Converts the sheet data into a list of KFA objects and handles the data.
+ *
+ * @param accessToken The access token for the Microsoft Graph API.
+ * @param sheetName The name of the Excel sheet.
+ * @param sheetId The unique identifier of the Excel sheet.
+ * @param cellAddress The cell address range to read from.
+ * @return A list of KFA objects.
+ */
+
+def readKFADataFromExcel(accessToken, sheetName, sheetId, cellAddress) {
+    def httpClient = HttpClients.createDefault()
+    def getUrl = "https://graph.microsoft.com/v1.0/me/drive/items/${sheetId}/workbook/worksheets('${sheetName}')/range(address='${cellAddress}')"
+   
+    // Set up the GET request
+    def getRequest = new HttpGet(getUrl)
+    getRequest.addHeader(HttpHeaders.CONTENT_TYPE, ContentType.APPLICATION_JSON.getMimeType())
+    getRequest.addHeader(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken)
+    println getRequest
+    List<KFA> kfaList = []
+    
+    try {
+        // Execute the GET request
+        HttpResponse getResponse = httpClient.execute(getRequest)
+        HttpEntity responseEntity = getResponse.getEntity()
+   
+        if (responseEntity != null) {
+            def responseBody = EntityUtils.toString(responseEntity)
+            def jsonSlurper = new JsonSlurper()
+            def jsonResponse = jsonSlurper.parseText(responseBody)
+            def sheetData = jsonResponse.values
+            def userFeatureType = "C"
+          
+            kfaList = sheetDataToKFA(sheetData, userFeatureType)
+           
+            handleKFAData(kfaList, accessToken, sheetId, userFeatureType)
+        } else {
+            System.err.println("GET response has no entity")
+        }
+    } catch (Exception e) {
+        System.err.println("GET request failed: ${e.statusCode} ${e.statusReason} - ${e.response?.entity?.getContent()?.text}")
+    } catch (Exception e) {
+        System.err.println("GET request failed: ${e.message}")
+    } finally {
+        httpClient.close()
+    }
+    
+    return kfaList
+}
+
+
+// Helper method to check if a type exists in the database
+def sendPatchRequest(httpClient, patchRequest, newValue) {
+def jsonBuilder = new JsonBuilder()
+jsonBuilder {
+  values(newValue)
+}
+
+def jsonEntity = new StringEntity(jsonBuilder.toString(), ContentType.APPLICATION_JSON)
+patchRequest.setEntity(jsonEntity)
+
+try {
+  HttpResponse patchResponse = httpClient.execute(patchRequest)
+  HttpEntity responseEntity = patchResponse.getEntity()
+  // Print the response status code and body
+  System.out.println("Response status code: ${patchResponse.getStatusLine().getStatusCode()}")
+  def responseBody = EntityUtils.toString(patchResponse.getEntity())
+  System.out.println("Response body: ${responseBody}")
+  if (responseEntity != null) {
+    System.out.println("PATCH response: $responseBody")
+  } else {
+    System.err.println("PATCH response has no entity")
+  }
+} catch (Exception e) {
+  System.err.println("PATCH request failed: ${e.statusCode} ${e.statusReason} - ${e.response?.entity?.getContent()?.text}")
+} catch (Exception e) {
+  System.err.println("PATCH request failed: ${e.message}")
+} finally {
+  httpClient.close()
+}
+}
+
+// Get the FlexibleSearchService bean
+def flexibleSearchService = Registry.getApplicationContext().getBean("flexibleSearchService", FlexibleSearchService.class)
+   
+/**
+ * Checks if a type with the given name exists in the database.
+ *
+ * @param typeName The name of the type to check.
+ * @return The count of records found for the given type.
+ */
+    
+def doesTypeExist(String typeName) {
+    try {
+        // Define the query string with the type name
+        String queryString = "SELECT {PK} FROM {${typeName}}"
+
+        // Create a FlexibleSearchQuery object
+        FlexibleSearchQuery flexibleQuery = new FlexibleSearchQuery(queryString)
+
+        // Execute the query and get the results
+        SearchResult result = flexibleSearchService.search(flexibleQuery)
+
+        // Return the count of records found
+        return result.result.size()
+    } catch (Exception e) {
+        return 0
+    }
+}
+
+/**
+ * Determines if a user is active within a specified user group.
+ *
+ * @param inUserType The type of user to check.
+ * @param inUserGroup The user group to check within.
+ * @return true if the user is active within the specified group, false otherwise.
+ */
+   
+def isActiveUserInGroup( String inUserType, String inUserGroup) {
+  try {
+    query = "Select COUNT({PK}) from {" + inUserType + 
+            "} where {loginDisabled} = 0 and " +
+              " {UID} in ( {{SELECT {u:uid} FROM { " +
+                                    "UserGroup as ug JOIN PrincipalGroupRelation as rel ON {ug:PK} = {rel:target} " +
+                                    " JOIN User AS u ON {rel:source} = {u:PK} } " +
+                            "WHERE {ug:uid}= '" + inUserGroup + "' }} )"
+    flexibleQuery = new FlexibleSearchQuery(query)
+    return ((flexibleSearchService.search(flexibleQuery).result).size() > 0)
+  }
+  catch(Exception e)
+  {
+    return false;
+  }
+}
+
+/**
+ * Checks if customer-specific pricing exists for a given item type and attribute.
+ *
+ * @param InItemType The type of item to check.
+ * @param inAtribute The attribute to check for.
+ * @return true if customer-specific pricing exists, false otherwise.
+ */
+def checkCustomerSpecificPricingExist(String InItemType,String inAtribute) {
+  try {
+    query = "Select {"+InItemType+":pk} from {"+InItemType+" as "+InItemType+" JOIN UserPriceGroup as pg ON {"+InItemType+":"+inAtribute+"}={pg:pk} JOIN PriceRow as price ON {price:ug}={pg:pk}}"
+    flexibleQuery = new FlexibleSearchQuery(query)
+    return ((flexibleSearchService.search(flexibleQuery).result).size() > 0)
+  }
+  catch(Exception e)
+  {
+    return false;
+  }
+}
+
+/**
+ * Checks for the existence of a property with a specific value or pattern.
+ *
+ * @param propertyName The name of the property to check.
+ * @param propertyValue (Optional) The value to check for.
+ * @param matchType The type of match to perform: "startsWith", "contains", or exact match.
+ * @return true if the property exists and matches the criteria, false otherwise.
+ */
+
+
+def checkProperty(String propertyName, String propertyValue = null, String matchType = "startsWith") {
+    def config = configurationService.getConfiguration()
+    def matchingKeys = matchType == "startsWith" ? config.getKeys().findAll { key -> key.startsWith(propertyName) } : matchType == "contains" ? config.getKeys().findAll { key -> key.contains(propertyName) } : config.getKeys().findAll { key -> key.equals(propertyName) }
+    def matchingValues = matchingKeys.collect { key -> config.getProperty(key) }.findAll { value -> StringUtils.isNotEmpty(value) }
+    
+    if (propertyValue != null) {
+        matchingValues = matchingValues.findAll { value -> 
+            // Check for exact match first
+            value.equalsIgnoreCase(propertyValue) ||
+            // Then check for comma-separated values
+            value.split(',').collect { it.trim().toLowerCase() }.contains(propertyValue.toLowerCase())
+        }
+    }
+    return !matchingValues.isEmpty()
+}
+
+/**
+ * Checks if a specific row exists for a given type, attribute, and value combination with a subselect in the WHERE clause.
+ *
+ * @param inValue The value to check for.
+ * @return true if the row exists, false otherwise.
+ */
+
+/* Find if a specific row for a given type, attribute, value combination exists with a sub select in the where clause */
+ 
+def checkCrossSellUpSell(String inValue) {
+  try {
+     query = "Select COUNT({PK}) from {ProductReference} where {referencetype} in (({{Select {PK} from {ProductReferenceTypeEnum} where {Code} = '" + inValue + "' }}))"
+     flexibleQuery = new FlexibleSearchQuery(query)
+   
+     // Execute the query and get the results
+        SearchResult result = flexibleSearchService.search(flexibleQuery)
+
+        // Return the count of records found
+        return result.result.size()
+    }
+  catch(Exception e)
+  {
+    return false;
+  }
+}
+
+
+                         
+/* Check if Principal is having accessible categories associated OR Categories having allowedPrincipal associated with it */
+
+def checkPrincipalAccessibleCategories(String inPricipalType) {
+  try {
+    query = "Select {cat:pk} from {Category as cat JOIN Category2PrincipalRelation as rel ON {rel:source}={cat:pk} JOIN "+ inPricipalType +" as principal ON {principal:pk}={rel:target}}"
+    flexibleQuery = new FlexibleSearchQuery(query)
+    return ((flexibleSearchService.search(flexibleQuery).result).size() > 0)
+  }
+  catch(Exception e)
+  {
+    return false;
+  }
+    
+}
+
+/**
+ * Checks conditions for a table based on type, attribute, and value.
+ *
+ * @param inType The type of table to check.
+ * @param inAttribute The attribute to check for.
+ * @param inValue The value to check for.
+ * @return The count of records found that match the conditions.
+ */
+  
+ def checkTableForConditions(String inType, String inAttribute, inValue) {
+    try {
+        def condition = ""
+
+        if (inValue instanceof String) {
+            if (inValue.startsWith('%') || inValue.endsWith('%')) {
+                condition = "{" + inAttribute + "} like ('" + inValue + "')"
+               println "sathish you are inside checkTableForConditions 1" + inValue
+            } else if (inValue == "NN") {
+                condition = "{" + inAttribute + "} IS NOT NULL"
+               println "sathish you are inside checkTableForConditions 2" + inValue
+            } else {
+                condition = "{" + inAttribute + "} = '" + inValue + "'"
+               println "sathish you are inside checkTableForConditions 3" + inValue
+            }
+        } else if (inValue instanceof Integer && inValue == 0) {
+            condition = "{" + inAttribute + "} > 0"
+           println "sathish you are inside checkTableForConditions 4" + inValue
+        } else {
+            condition = "{" + inAttribute + "} = " + inValue
+           println "sathish you are inside checkTableForConditions 5" + inValue
+        }
+
+        def query = "Select {PK} from {" + inType + "} where " + condition
+     println query
+        def flexibleQuery = new FlexibleSearchQuery(query)
+ //       return (flexibleSearchService.search(flexibleQuery).result.size() > 0)
+      def result = flexibleSearchService.search(flexibleQuery).result.size()
+  // Return the count of records found
+        return result
+  
+    } catch (Exception e) {
+//       println "sathish you are inside exception checkTableForConditions"
+      return false
+    }
+}
+
+/**
+ * Checks if content is localized for a given table.
+ *
+ * @param inTable The table to check.
+ * @return true if content is localized, false otherwise.
+ */
+   
+@CompileStatic
+def checkLocalizedContent(String inTable) {
+    SqlSearchResultData searchResult
+    String query = "SELECT DISTINCT(langpk) FROM " + inTable + "lp"
+    HacFlexibleSearchFacade flexibleSearchFacade = new HacFlexibleSearchFacade()
+
+    try {
+        searchResult = flexibleSearchFacade.executeRawSql(query, 20000000, false)
+        searchResult.resultList.each { item ->
+            if (!checkTableForConditions("Language", "PK", item[0])) {
+                println("Query: $query\nItem: $item")
+                throw new Exception("Data Error: Query: $query LanguagePK: $item")
+            }
+        }
+        return true
+    } catch (Exception e) {
+        return false
+    }
+}
+
+/**
+ * Checks if multiple logical systems exist in the SAPGlobalConfiguration.
+ *
+ * @param inLogical The logical system to check for.
+ * @return true if multiple logical systems are found, false otherwise.
+ */
+  
+def checkMultipleLogicalSystemsInSAPGlobalConfiguration(String inLogical) {
+  try {
+    query = "Select {sys:pk} from {SAPGlobalConfiguration as config JOIN" +inLogical+ "as sys ON {sys:sapGlobalConfiguration}={config:pk}}"
+    flexibleQuery = new FlexibleSearchQuery(query)
+    return ((flexibleSearchService.search(flexibleQuery).result).size() > 1)
+  }
+  catch(Exception e)
+  {
+    return false;
+  }
+}
+
+/**
+ * Checks if an IntegrationObject has a root item.
+ *
+ * @param InRootItemCode The code of the root item to check for.
+ * @return true if the IntegrationObject has the specified root item, false otherwise.
+ */
+
+def checkIntegrationObjectWithRootItem(String InRootItemCode) {
+  try {
+    query = "Select {io:pk} from {IntegrationObject as io JOIN IntegrationObjectItem as ioItem ON {ioItem:integrationObject}={io:pk}} Where {ioItem:code}='"+InRootItemCode+"' and {ioItem:root}=1"
+    flexibleQuery = new FlexibleSearchQuery(query)
+    return ((flexibleSearchService.search(flexibleQuery).result).size() > 0)
+  }
+  catch(Exception e)
+  {
+    return false;
+  }
+}
+
+/**
+ * Handles the KFA data by sending it to a specified Excel sheet.
+ *
+ * @param kfa The list of KFA objects to handle.
+ * @param accessToken The access token for the Microsoft Graph API.
+ * @param sheetId The unique identifier of the Excel sheet.
+ * @param userFeatureType The feature type to filter by.
+ */
+  
+def checkPagesWithStatusNotActive(String statusVal) {
+  try {
+    query = "SELECT {ap.PK},{ps.PK} FROM {AbstractPage AS ap JOIN CMSPageStatus AS ps ON {ap.pageStatus}={ps.PK}} WHERE {ps.code} <> '"+statusVal+"'"
+    flexibleQuery = new FlexibleSearchQuery(query)
+    return ((flexibleSearchService.search(flexibleQuery).result).size() > 0)
+  }
+  catch(Exception e)
+  {
+    return false;
+  }
+}
+
+/* Check Backoffice special collection by collectiontype*/
+ 
+def checkBackofficeSpecialCollectionByCollectionType(String inCollectionType) {
+  try {
+    query = "Select {splCollection:pk} from {BackofficeObjectSpecialCollection as splCollection JOIN BackofficeSpecialCollectionType as collType ON {splCollection:collectionType}={collType:pk}} Where {collType:code}='"+inCollectionType+"'"
+    flexibleQuery = new FlexibleSearchQuery(query)
+    return ((flexibleSearchService.search(flexibleQuery).result).size() > 0)
+  }
+  catch(Exception e)
+  {
+    return false;
+  }
+}
+def verifyCreditCardNumbersMasked(String masked = null) {
+    def query = "SELECT COUNT({PK}) FROM {CreditCardPaymentInfo} WHERE {number} IS NOT NULL AND {number} NOT LIKE '%*%'"
+  
+   try {
+        def flexibleQuery = new FlexibleSearchQuery(query)
+        def count = flexibleSearchService.search(flexibleQuery).result[0]
+
+        if (count > 0) {
+            def unmaskedCards = flexibleSearchService.search(new FlexibleSearchQuery("SELECT {PK}, {number} FROM {CreditCardPaymentInfo} WHERE {number} IS NOT NULL AND {number} NOT LIKE '%*%'")).result
+            for (item in unmaskedCards) {
+                println("Unmasked Card:" + item[1])
+            }
+            throw new Exception("Unmasked CREDIT Card Error")
+        }
+      
+        return true;
+    } catch (Exception e) {
+        return false
+    
+    }
+}
+
+/**
+ * Determines if a specific extension is loaded.
+ *
+ * @param inExtensionName The name of the extension to check for.
+ * @return true if the extension is loaded, false otherwise.
+ */
+   
+def findExtension(String inExtensionName) {
+    loadedExtensions.find { it.name.equalsIgnoreCase(inExtensionName) } != null
+}
+
+/**
+ * Creates a GET request to retrieve data from an Excel sheet using the Microsoft Graph API.
+ *
+ * @param accessToken The access token for the Microsoft Graph API.
+ * @param sheetName The name of the Excel sheet.
+ * @param sheetId The unique identifier of the Excel sheet.
+ * @param cellAddress The cell range to retrieve data from.
+ * @return An array containing the HTTP client and the created GET request.
+ */
+
+def creategetRequest(accessToken, sheetName, sheetId, cellAddress) {
+    def getUrl = "https://graph.microsoft.com/v1.0/me/drive/items/${sheetId}/workbook/worksheets('${sheetName}')/range(address='${cellAddress}')"
+    
+    def httpClient = HttpClients.createDefault()
+    def createRequest = new HttpPatch(getUrl)
+    createRequest.addHeader(HttpHeaders.CONTENT_TYPE, ContentType.APPLICATION_JSON.getMimeType())
+    createRequest.addHeader(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken)
+    return [httpClient, createRequest]
+}
+
+/**
+ * Handles the KFA data by sending it to a specified Excel sheet.
+ *
+ * @param kfa The list of KFA objects to handle.
+ * @param accessToken The access token for the Microsoft Graph API.
+ * @param sheetId The unique identifier of the Excel sheet.
+ * @param userFeatureType The feature type to filter by.
+ */
+
+def handleKFAData(List<KFA> kfa, String accessToken, String sheetId, String userFeatureType) {
+    
+    def baseSheetName = "CustomerOutput"
+    /*def cellAddress = "A2:D220" */
+    def startRow = 3
+    def endRow = startRow + kfa.size() - 1  // Calculate the end row dynamically
+    def sheetName
+    if (userFeatureType == 'B') {
+        sheetName = "${baseSheetName}_B2B"
+    } else {
+        sheetName = "${baseSheetName}_B2C"
+    }
+    def cellAddress = "A${startRow}:D${endRow}"  
+
+  // Define a list of method names that require special handling
+    def specialMethods = ["checkProperty", "isActiveUserInGroup", "checkTableForConditions","checkCustomerSpecificPricingExist"]
+
+    def allNewValues = kfa.collect { kfaObj ->
+        def methodMap = [
+            "doesTypeExist": this.&doesTypeExist, 
+            "findExtension": this.&findExtension,
+            "getBeanIfExists":this.&getBeanIfExists,
+            "checkProperty": this.&checkProperty,
+          "verifyCreditCardNumbersMasked":this.&verifyCreditCardNumbersMasked,
+            "isActiveUserInGroup":this.&isActiveUserInGroup,
+          "checkTableForConditions":this.&checkTableForConditions,
+          "checkCustomerSpecificPricingExist":this.&checkCustomerSpecificPricingExist,
+          "checkLocalizedContent":this.&checkLocalizedContent,
+          "checkPrincipalAccessibleCategories":this.&checkPrincipalAccessibleCategories,
+          "checkMultipleLogicalSystemsInSAPGlobalConfiguration":this.&checkMultipleLogicalSystemsInSAPGlobalConfiguration,
+          "checkCrossSellUpSell":this.&checkCrossSellUpSell,
+          "checkPagesWithStatusNotActive":this.&checkPagesWithStatusNotActive
+            // Add more method references as needed
+        ]
+
+        def enableFlag = true
+        def usedCount = []
+        def success = true
+
+        if (kfaObj.enableMeth && !kfaObj.enableArg.empty) {
+            kfaObj.enableArg.each { enableArgItem ->
+                def methodRef = methodMap[kfaObj.enableMeth]
+                def methodResult = methodRef(enableArgItem)
+                if (!methodResult) {
+                    enableFlag = false
+                }
+            }
+        }
+
+        if (kfaObj.usedMeth && !kfaObj.usedMeth.empty) {
+            kfaObj.usedMeth.eachWithIndex { usedMethItem, index ->
+                def usedArgs = kfaObj.usedArg[index]
+                 if (specialMethods.contains(usedMethItem)) {
+                    usedArgs.each { usedArgItem ->
+                        def methodRef = methodMap[usedMethItem]
+                        def args = usedArgItem.tokenize("~")
+                        def propertyName = args.size() > 0 ? args[0] : null
+                        def propertyValue = args.size() > 1 ? args[1] : null
+                        def matchType = args.size() > 2 ? args[2] : null
+                        def methodArgs = [propertyName, propertyValue, matchType].findAll { it != null }
+                         println "methodsatargs " + methodArgs 
+                       def methodResult = methodRef(*methodArgs)
+                        println "methodsat " + usedMethItem + propertyName + propertyValue + matchType
+                        if (usedMethItem == "checkTableForConditions") {     
+                            usedCount << [propertyName, methodResult].join("_")
+                        }
+                        if (!methodResult) {
+                            success = false
+                        }
+                    }
+                } else {
+                    usedArgs.each { usedArgsItem ->
+                        def methodRef = methodMap[usedMethItem]
+                        def methodArgs = usedArgsItem.tokenize(",")
+                       println "methodsatargs " + usedMethItem + methodArgs 
+                        def usedMethResult = methodRef(*methodArgs)
+                        if (usedMethItem == "doesTypeExist" || usedMethItem == "checkCrossSellUpSell") {     
+                            usedCount << [usedArgsItem, usedMethResult].join("_")
+                        }
+                        if (!usedMethResult) {
+                            success = false
+                        }
+                    }
+                }
+            }
+        }
+
+        [
+            kfaObj.featureId,
+            kfaObj.enableMeth && !kfaObj.enableArg.empty ? enableFlag ? "True" : "False" : "NA",
+            kfaObj.usedMeth && !kfaObj.usedMeth.empty ? usedCount ? usedCount.join(",") : "NA" : "NA",
+            kfaObj.usedMeth && !kfaObj.usedMeth.empty ? success ? "True" : "False" : "NA"
+            
+        ]
+    }
+
+    sendPatchRequest(HttpClients.createDefault(), creategetRequest(accessToken, sheetName, sheetId, cellAddress).last(), allNewValues)
+}
+// Main execution
+
+def sheetName = "kfamaster"
+def cellAddress = "A2:E234"
+
+readKFADataFromExcel(accessToken, sheetName, sheetId, cellAddress)
